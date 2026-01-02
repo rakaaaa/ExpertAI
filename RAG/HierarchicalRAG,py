@@ -1,0 +1,94 @@
+import redis
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from llama_cpp import Llama
+
+# -----------------------------
+# DEBUG: Connect to Redis
+# -----------------------------
+redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
+print("[DEBUG] Connected to Redis")
+
+# -----------------------------
+# Load models
+# -----------------------------
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+llm = Llama(model_path="./models/llama-2-7b.gguf", n_ctx=2048)
+print("[DEBUG] Models loaded")
+
+# -----------------------------
+# Hierarchical data
+# -----------------------------
+doc_id = "doc_1"
+section_id = "doc_1_sec_1"
+
+redis_client.hset("documents", doc_id, "Data Privacy Policy Overview")
+redis_client.hset("sections", section_id, "Consent and data usage rules")
+
+chunks = [
+    ("chunk_1", "User consent must be explicitly recorded."),
+    ("chunk_2", "Consent can be revoked at any time."),
+    ("chunk_3", "Violations lead to penalties.")
+]
+
+# -----------------------------
+# Store hierarchy
+# -----------------------------
+for cid, text in chunks:
+    redis_client.hset("chunks", cid, text)
+    redis_client.hset("chunk_to_section", cid, section_id)
+    print(f"[DEBUG] Stored chunk {cid} with parent section")
+
+# -----------------------------
+# Embed chunks
+# -----------------------------
+chunk_texts = [c[1] for c in chunks]
+embeddings = embedder.encode(chunk_texts)
+
+index = faiss.IndexFlatL2(embeddings.shape[1])
+index.add(np.array(embeddings))
+print("[DEBUG] FAISS index built")
+
+# -----------------------------
+# Query
+# -----------------------------
+query = "What happens if a user revokes consent?"
+q_emb = embedder.encode([query])
+_, idx = index.search(np.array(q_emb), 2)
+
+retrieved_chunks = []
+parent_sections = set()
+
+for i in idx[0]:
+    cid, text = chunks[i]
+    retrieved_chunks.append(text)
+    parent_sections.add(redis_client.hget("chunk_to_section", cid))
+
+print("[DEBUG] Retrieved chunks:", retrieved_chunks)
+print("[DEBUG] Parent sections:", parent_sections)
+
+# -----------------------------
+# Expand context hierarchically
+# -----------------------------
+section_context = [
+    redis_client.hget("sections", sid) for sid in parent_sections
+]
+
+final_context = "\n".join(section_context + retrieved_chunks)
+
+# -----------------------------
+# Generate answer
+# -----------------------------
+prompt = f"""
+Answer using the structured context below.
+
+Context:
+{final_context}
+
+Question:
+{query}
+"""
+
+response = llm(prompt)
+print("\nFinal Answer:\n", response["choices"][0]["text"])
